@@ -23,7 +23,7 @@ jobs:
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
     - name: Build desktop
-      run: ./gradlew :ide-desktop:assembleDebug
+      run: ./gradlew :ide-desktop:run
     - name: Build android
       run: ./gradlew :ide-android:assembleDebug
     - name: Upload project
