@@ -29,6 +29,9 @@ import org.objectweb.asm.MethodVisitor
 import kotlin.metadata.isSuspend
 import kotlin.metadata.jvm.KotlinClassMetadata
 import kotlin.metadata.jvm.annotations
+import kotlin.metadata.jvm.getterSignature
+import kotlin.metadata.jvm.setterSignature
+import kotlin.metadata.jvm.signature
 
 /**
  * Decodes a classpath `.class` file's `@kotlin.Metadata` into neutral symbols. Recovers the Kotlin view
@@ -96,6 +99,143 @@ object KotlinMetadata {
             else -> false // a real Class, an Unknown/newer-version blob, or unparseable → keep it
         }
     }
+
+    /**
+     * For a MULTI-FILE class facade (`CollectionsKt`, `MathKt` — a public aggregator that carries no members
+     * of its own; its top-level declarations live in `…__…Kt` PART classes), the part classes' internal names
+     * (`kotlin/collections/CollectionsKt__CollectionsKt`). Null for anything else (a plain class, a single-file
+     * facade, non-Kotlin bytecode). Lets a decompiler expand the near-empty facade into its real declarations.
+     */
+    fun multifileFacadeParts(classBytes: ByteArray): List<String>? {
+        val metadata = extract(classBytes) ?: return null
+        val km = runCatching { KotlinClassMetadata.readLenient(metadata) }.getOrNull()
+        return (km as? KotlinClassMetadata.MultiFileClassFacade)?.partClassNames
+    }
+
+    /**
+     * Maps each name a caller resolves a Kotlin declaration by — a function's Kotlin name, and a property's
+     * conventional accessor names (`getX`/`setX`) — to the ACTUAL JVM method names the compiler emitted for it,
+     * INCLUDING the value-class `name-<hash>` and `internal` `name$module` manglings. This is the authoritative
+     * mapping (the JVM signature is stored verbatim in `@Metadata`, exactly what kotlin-reflect reads), so a
+     * caller can match a mangled `java.lang.reflect.Method` by EXACT name instead of guessing the mangling
+     * shape. Returns null when [metadata] carries no members to map (a multi-file FACADE — its members live in
+     * `…__…Kt` PART classes — or an unparseable/newer blob); a caller treats that as "no authoritative answer"
+     * and falls back to its shape heuristic.
+     *
+     * The accessor keys are derived with the SAME `get`/`set` + first-char-titlecase convention the reflective
+     * reader forms its lookup name with, so a value-class-typed property whose getter mangles to
+     * `getBalance-<hash>` is found by the reader's `getBalance` lookup — and a boolean `isX` property (getter
+     * `isX`, which the reader would still probe as `getIsX`) is picked up by its `getIsX` key too.
+     */
+    fun jvmNameIndex(metadata: Metadata): Map<String, Set<String>>? {
+        val km = runCatching { KotlinClassMetadata.readLenient(metadata) }.getOrNull() ?: return null
+        val functions: List<KmFunction>
+        val properties: List<KmProperty>
+        when (km) {
+            is KotlinClassMetadata.Class -> {
+                functions = km.kmClass.functions; properties = km.kmClass.properties
+            }
+            is KotlinClassMetadata.FileFacade -> {
+                functions = km.kmPackage.functions; properties = km.kmPackage.properties
+            }
+            is KotlinClassMetadata.MultiFileClassPart -> {
+                functions = km.kmPackage.functions; properties = km.kmPackage.properties
+            }
+            else -> return null // a multi-file facade (members live in the parts) / synthetic / unknown blob
+        }
+        val out = HashMap<String, MutableSet<String>>()
+        fun put(lookup: String, jvm: String) = out.getOrPut(lookup) { HashSet() }.add(jvm)
+        functions.forEach { f -> put(f.name, f.signature?.name ?: f.name) }
+        properties.forEach { p ->
+            p.getterSignature?.let { put("get" + p.name.capitalizeAscii(), it.name) }
+            p.setterSignature?.let { put("set" + p.name.capitalizeAscii(), it.name) }
+        }
+        return if (out.isEmpty()) null else out
+    }
+
+    /** [jvmNameIndex] off a class's raw bytes (the jar-reading path) — decodes its `@Metadata` first. */
+    fun jvmNameIndex(classBytes: ByteArray): Map<String, Set<String>>? =
+        extract(classBytes)?.let { jvmNameIndex(it) }
+
+    /** First-char titlecase, matching the reflective reader's `get`/`set` accessor-name convention. */
+    private fun String.capitalizeAscii(): String =
+        replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+
+    /** The opt-in-relevant annotation facts read from one class's bytecode. */
+    class OptInScan(
+        /** Annotation FQNs on the class declaration itself (a type's own markers, e.g. `@ExperimentalFoo class Bar`). */
+        val classAnnotations: List<String>,
+        /** Method name → the annotation FQNs present on EVERY method of that name (the intersection across
+         *  overloads). A marker is thus attributed to a name only when all its overloads carry it — sound: an
+         *  opt-in usage is never over-reported for an overload set where only some members are experimental. */
+        val methodAnnotations: Map<String, List<String>>,
+        /** When THIS class is a `@kotlin.RequiresOptIn` marker annotation, its declared level (`"ERROR"` /
+         *  `"WARNING"`, default `"ERROR"`); null when the class is not a marker. */
+        val requiresOptInLevel: String?,
+    )
+
+    private const val REQUIRES_OPT_IN_DESC = "Lkotlin/RequiresOptIn;"
+
+    /**
+     * ASM-scan [classBytes] for the opt-in mechanism's annotations — the authoritative source, since a
+     * `@RequiresOptIn` marker is `@Retention(BINARY)` and so lands in `RuntimeInvisibleAnnotations` (both
+     * visible and invisible are read). This is how a library declaration's experimental markers are recovered
+     * on demand (no `@Metadata` decode needed; the annotations aren't reliably in the metadata blob). Null when
+     * the bytes can't be read.
+     */
+    fun scanOptIn(classBytes: ByteArray): OptInScan? {
+        val reader = runCatching { ClassReader(classBytes) }.getOrNull() ?: return null
+        val classAnnos = ArrayList<String>()
+        var markerLevel: String? = null
+        var isMarker = false
+        // Per method NAME, the sets of annotation FQNs seen on each method of that name (one set per overload),
+        // intersected at the end so a name is only attributed a marker when EVERY overload carries it.
+        val perMethod = HashMap<String, MutableList<MutableSet<String>>>()
+        reader.accept(object : ClassVisitor(Opcodes.ASM9) {
+            override fun visitAnnotation(descriptor: String?, visible: Boolean): AnnotationVisitor? {
+                descriptor?.let { classAnnos += fqnOfDesc(it) }
+                if (descriptor == REQUIRES_OPT_IN_DESC) {
+                    isMarker = true
+                    return object : AnnotationVisitor(Opcodes.ASM9) {
+                        override fun visitEnum(name: String?, desc: String?, value: String?) {
+                            if (name == "level" && value != null) markerLevel = value
+                        }
+                    }
+                }
+                return null
+            }
+
+            override fun visitMethod(access: Int, name: String, descriptor: String, sig: String?, ex: Array<out String>?): MethodVisitor {
+                // Key by the demangled Kotlin name so a target looked up by its source name (`Text`) matches a
+                // value-class-mangled JVM method (`Text-<hash>`); skip compiler synthetics (`foo$default`,
+                // `access$…`) whose annotations would dilute the real member's when intersected.
+                if ('$' in name) return NULL_METHOD_VISITOR
+                val here = HashSet<String>()
+                perMethod.getOrPut(name.substringBefore('-')) { ArrayList() }.add(here)
+                return object : MethodVisitor(Opcodes.ASM9) {
+                    override fun visitAnnotation(desc: String?, visible: Boolean): AnnotationVisitor? {
+                        desc?.let { here += fqnOfDesc(it) }
+                        return null
+                    }
+                }
+            }
+        }, ClassReader.SKIP_CODE or ClassReader.SKIP_DEBUG or ClassReader.SKIP_FRAMES)
+        val methodAnnos = perMethod.mapValues { (_, overloads) ->
+            overloads.reduce { acc, s -> acc.apply { retainAll(s) } }.toList()
+        }.filterValues { it.isNotEmpty() }
+        return OptInScan(
+            classAnnotations = classAnnos,
+            methodAnnotations = methodAnnos,
+            requiresOptInLevel = if (isMarker) (markerLevel ?: "ERROR") else null,
+        )
+    }
+
+    private val NULL_METHOD_VISITOR = object : MethodVisitor(Opcodes.ASM9) {}
+
+    /** FQN of an annotation type descriptor (`Lcom/foo/Bar;` → `com.foo.Bar`). */
+    private fun fqnOfDesc(desc: String): String =
+        if (desc.startsWith("L") && desc.endsWith(";")) desc.substring(1, desc.length - 1).replace('/', '.')
+        else desc
 
     /** One-shot guard so a decode failure (e.g. `kotlin-metadata-jvm` missing on ART) is logged once, not per class. */
     private val loggedDecodeFailure = java.util.concurrent.atomic.AtomicBoolean(false)

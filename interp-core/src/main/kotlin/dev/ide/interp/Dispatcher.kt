@@ -51,12 +51,29 @@ private fun nestedNameCandidates(fqn: String): List<String> {
 }
 
 /** Whether a JVM method/field name corresponds to the Kotlin name [kotlinName]. Kotlin MANGLES the JVM name
- *  of anything that takes/returns an inline value class (`Color`, `Dp`, `TextUnit`, …) to `name-<hash>` — so
- *  the literal name won't match; the `name-` prefix does. The mangling hash never contains `$`, so a `$`
- *  excludes the OTHER synthetics that share the prefix — `getRed-<hash>$annotations` (returns void) and
- *  `foo-<hash>$default` — which must NOT be mistaken for the real member. */
-internal fun mangledNameMatches(jvmName: String, kotlinName: String): Boolean =
-    jvmName == kotlinName || (jvmName.startsWith("$kotlinName-") && '$' !in jvmName)
+ *  in two ways this must see through:
+ *   - a member that takes/returns an inline value class (`Color`, `Dp`, `TextUnit`, …) → `name-<hash>`; the
+ *     hash never contains `$`, so a `$` excludes the sibling synthetics that share the prefix
+ *     (`getRed-<hash>$annotations` (returns void), `foo-<hash>$default`);
+ *   - an `internal` member → `name$<module>` (Material3's `MotionScheme.Companion.expressive()` compiles to
+ *     `expressive$material3`), optionally layered on the value-class form (`name-<hash>$<module>`).
+ *  For the internal case the part before the module suffix must be the Kotlin name (or its value-class-mangled
+ *  form) and the suffix must be a SINGLE segment that isn't a known compiler synthetic (`default`/`annotations`
+ *  have their own handling and must not be read as a real member). */
+internal fun mangledNameMatches(jvmName: String, kotlinName: String): Boolean {
+    if (jvmName == kotlinName) return true
+    if (jvmName.startsWith("$kotlinName-") && '$' !in jvmName) return true
+    val dollar = jvmName.indexOf('$')
+    if (dollar <= 0) return false
+    val base = jvmName.substring(0, dollar)
+    val suffix = jvmName.substring(dollar + 1)
+    val baseMatches = base == kotlinName || base.startsWith("$kotlinName-")
+    return baseMatches && '$' !in suffix && suffix !in NON_INTERNAL_DOLLAR_SUFFIXES
+}
+
+/** The `$`-suffixed synthetics [mangledNameMatches] must NOT treat as an `internal` module suffix — they are
+ *  compiler-generated siblings of a real member (handled elsewhere), not the member itself. */
+private val NON_INTERNAL_DOLLAR_SUFFIXES = setOf("default", "annotations")
 
 /** Bound on how deep a value class can nest another (`Color`→`ULong`→`long`) when unboxing to a primitive
  *  param — real chains are 1–2 deep; the cap just stops a pathological/cyclic case. */
@@ -98,12 +115,21 @@ object OmittedArg
  * Reorder evaluated [args] (in source order, 1:1 with [rawArgs]) into the callee's declared parameter order
  * when the call uses NAMED arguments, returning a dense list of size [paramNames].size with [OmittedArg] in
  * every slot no argument targets. A trailing lambda still binds to the LAST parameter (Kotlin's
- * trailing-lambda rule). Returns [args] unchanged when there are no named arguments, the parameter names
- * aren't known, or an argument can't be mapped — so the positional fast paths stay untouched, and a second
- * call on an already-reordered list (size ≠ [rawArgs].size) is a no-op.
+ * trailing-lambda rule). Returns [args] unchanged when the parameter names aren't known, an argument can't be
+ * mapped, or the call is purely positional with nothing to remap — so the positional fast paths stay
+ * untouched, and a second call on an already-reordered list (size ≠ [rawArgs].size) is a no-op.
+ *
+ * A purely POSITIONAL call is also reordered when it ends in a syntactic trailing lambda that must SKIP
+ * defaulted parameters to reach the last one: `Theme { content }` for `fun Theme(dark: Boolean = …, content:
+ * () -> Unit)` binds the lambda to `content` and defaults `dark` — not the lambda to `dark` (which would leave
+ * the required `content` null). Only when fewer args than parameters are supplied; a fully-supplied positional
+ * call already lines up 1:1, so it stays on the untouched fast path.
  */
 fun reorderNamedArgs(paramNames: List<String>, rawArgs: List<RArg>, args: List<Any?>): List<Any?> {
-    if (paramNames.isEmpty() || args.size != rawArgs.size || rawArgs.none { it.name != null }) return args
+    if (paramNames.isEmpty() || args.size != rawArgs.size) return args
+    val hasNamed = rawArgs.any { it.name != null }
+    val trailingLambdaSkipsDefaults = rawArgs.lastOrNull()?.trailingLambda == true && args.size < paramNames.size
+    if (!hasNamed && !trailingLambdaSkipsDefaults) return args
     val n = paramNames.size
     val nameToIndex = HashMap<String, Int>(n * 2)
     paramNames.forEachIndexed { i, nm -> nameToIndex.putIfAbsent(nm, i) }
@@ -476,8 +502,10 @@ class ReflectiveDispatcher(
     }
 
     private fun invokeStatic(ownerFqn: String, name: String, args: List<Any?>, composable: List<Boolean>, receiverCount: Int): Any? {
-        // A facade only the project's library jars carry (not loadable here) executes in the library executor.
-        if (libraryFallback != null && loadClassOrNull(ownerFqn) == null && libraryFallback.hasClass(ownerFqn)) {
+        // A facade the library executor owns runs there: one the host can't load at all (a project-only jar),
+        // OR one it prefers the project's version of over a version-skewed bundled build (Material3). Keying on
+        // `hasClass` (not host-loadability) lets the latter win — the executor's own gate decides.
+        if (libraryFallback != null && libraryFallback.hasClass(ownerFqn)) {
             return libraryFallback.invokeStatic(ownerFqn, name, args, receiverCount)
         }
         val cls = loadClass(ownerFqn)
@@ -561,7 +589,7 @@ class ReflectiveDispatcher(
         cache[key]?.let { InterpProfile.count("cacheHit"); return it.method }
         InterpProfile.count("cacheMiss")
         val fitting = (cls.methods.asSequence() + interfaceDefaultSynthetics(cls, name))
-            .filter { Modifier.isStatic(it.modifiers) && isDefaultSynthetic(it.name, name) && fitsDefaultSynthetic(it, realArgs) }
+            .filter { Modifier.isStatic(it.modifiers) && isDefaultSynthetic(cls, it.name, name) && fitsDefaultSynthetic(it, realArgs) }
             .toList()
         val minArity = fitting.minOfOrNull { it.parameterCount }
         // Among the smallest-arity fitting synthetics, prefer the MOST SPECIFIC for the args — else two
@@ -602,15 +630,15 @@ class ReflectiveDispatcher(
             val iface = queue.removeFirst()
             if (!seen.add(iface.name)) continue
             iface.interfaces.forEach(queue::add)
-            runCatching { iface.declaredMethods.filterTo(out) { Modifier.isStatic(it.modifiers) && isDefaultSynthetic(it.name, name) } }
+            runCatching { iface.declaredMethods.filterTo(out) { Modifier.isStatic(it.modifiers) && isDefaultSynthetic(cls, it.name, name) } }
             runCatching { Class.forName("${iface.name}\$DefaultImpls", false, iface.classLoader ?: loader) }
-                .getOrNull()?.let { di -> runCatching { di.declaredMethods.filterTo(out) { Modifier.isStatic(it.modifiers) && isDefaultSynthetic(it.name, name) } } }
+                .getOrNull()?.let { di -> runCatching { di.declaredMethods.filterTo(out) { Modifier.isStatic(it.modifiers) && isDefaultSynthetic(cls, it.name, name) } } }
         }
         return out
     }
 
-    private fun isDefaultSynthetic(jvmName: String, kotlinName: String): Boolean =
-        jvmName.endsWith("\$default") && mangledNameMatches(jvmName.removeSuffix("\$default"), kotlinName)
+    private fun isDefaultSynthetic(cls: Class<*>, jvmName: String, kotlinName: String): Boolean =
+        jvmName.endsWith("\$default") && KotlinJvmNames.matches(cls, jvmName.removeSuffix("\$default"), kotlinName)
 
     /** The synthetic is `(realParams…, int mask, Object marker)`; [realArgs] must fit the first `n` reals. */
     private fun fitsDefaultSynthetic(m: Method, realArgs: List<Any?>): Boolean {
@@ -648,8 +676,10 @@ class ReflectiveDispatcher(
     }
 
     private fun construct(ownerFqn: String, args: List<Any?>, composable: List<Boolean>, declaredParamCount: Int): Any? {
-        // A type only the project's library jars carry constructs in the library executor.
-        if (libraryFallback != null && loadClassOrNull(ownerFqn) == null && libraryFallback.hasClass(ownerFqn)) {
+        // A type the library executor owns constructs there — one the host can't load, or one it prefers the
+        // project's version of (Material3). Keyed on `hasClass` so the executor's own gate decides (see
+        // [invokeStatic]).
+        if (libraryFallback != null && libraryFallback.hasClass(ownerFqn)) {
             return libraryFallback.construct(ownerFqn, args)
         }
         // An unqualified type name (a stdlib exception the resolver couldn't fully qualify, e.g.
@@ -1056,7 +1086,7 @@ class ReflectiveDispatcher(
      *  is invokable under the JDK module system. Callers try this only AFTER the `$default` synthetic. */
     private fun findByArity(cls: Class<*>, name: String, args: List<Any?>, static: Boolean): Method? {
         val byArity = cls.methods.filter { m ->
-            mangledNameMatches(m.name, name) && !m.isVarArgs && m.parameterCount == args.size && (Modifier.isStatic(m.modifiers) == static)
+            KotlinJvmNames.matches(cls, m.name, name) && !m.isVarArgs && m.parameterCount == args.size && (Modifier.isStatic(m.modifiers) == static)
         }
         val m = byArity.firstOrNull { Modifier.isPublic(it.declaringClass.modifiers) } ?: byArity.firstOrNull() ?: return null
         if (!static && !Modifier.isPublic(m.declaringClass.modifiers)) publicMethod(cls, m.name, m.parameterCount)?.let { return it }
@@ -1067,7 +1097,7 @@ class ReflectiveDispatcher(
         // Vararg methods are excluded here (`!isVarArgs`) and handled by [findVarargMethod]/[invokeVararg]:
         // their JVM arity counts the array as ONE param, so an exact-arity match would mis-bind the scalar args.
         val byArity = cls.methods.filter { m ->
-            mangledNameMatches(m.name, name) && !m.isVarArgs && m.parameterCount == args.size && (Modifier.isStatic(m.modifiers) == static)
+            KotlinJvmNames.matches(cls, m.name, name) && !m.isVarArgs && m.parameterCount == args.size && (Modifier.isStatic(m.modifiers) == static)
         }
         val accepting = byArity.filter { paramsAccept(it.parameterTypes, args) }
         // Prefer the MOST SPECIFIC applicable overload (Java/Kotlin overload resolution) rather than whichever
@@ -1113,7 +1143,7 @@ class ReflectiveDispatcher(
 
     private fun findVarargMethodUncached(cls: Class<*>, name: String, args: List<Any?>, static: Boolean): Method? {
         val candidates = cls.methods.filter { m ->
-            m.isVarArgs && mangledNameMatches(m.name, name) && Modifier.isStatic(m.modifiers) == static &&
+            m.isVarArgs && KotlinJvmNames.matches(cls, m.name, name) && Modifier.isStatic(m.modifiers) == static &&
                 m.parameterCount >= 1 && args.size >= m.parameterCount - 1 &&
                 leadingParamsAccept(m.parameterTypes, args, m.parameterCount - 1)
         }

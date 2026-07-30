@@ -2,6 +2,7 @@ package dev.ide.interp.compose
 
 import dev.ide.interp.InterpProfile
 import dev.ide.interp.InterpretedLambda
+import dev.ide.interp.KotlinJvmNames
 import dev.ide.interp.OmittedArg
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -42,22 +43,12 @@ object ComposableAbi {
         val owner = loadClassNoInit(ownerFqn, loader) ?: return false
         val result = runCatching {
             owner.methods.any { m ->
-                nameMatches(
-                    m.name,
-                    method
-                ) && m.parameterTypes.any { isComposerType(it) }
+                KotlinJvmNames.matches(owner, m.name, method) && m.parameterTypes.any { isComposerType(it) }
             }
         }.getOrDefault(false)
         composableFormCache[key] = result // class loaded → answer is stable
         return result
     }
-
-    /** Whether a JVM method name corresponds to the Kotlin function [kotlinName]. Kotlin MANGLES the JVM name
-     *  of any function that takes/returns an inline value class (Compose's `Text` has `Color`/`TextUnit`
-     *  params) to `name-<hash>` for binary-compat — so the literal name won't match; the prefix does. The hash
-     *  never contains `$`, so excluding `$` skips sibling synthetics (`…$annotations`, `…$default`). */
-    private fun nameMatches(jvmName: String, kotlinName: String): Boolean =
-        jvmName == kotlinName || (jvmName.startsWith("$kotlinName-") && '$' !in jvmName)
 
     /** A `Composer` parameter — matched by simple name as a fallback too, in case a relocated/shaded build
      *  reports a package-qualified name we don't expect (we still want to detect the composer slot). */
@@ -90,7 +81,7 @@ object ComposableAbi {
     fun diagnose(ownerFqn: String, method: String, loader: ClassLoader? = null): String {
         val owner = loadClassNoInit(ownerFqn, loader)
             ?: return " [composer-path skipped: class `$ownerFqn` is not loadable from the IDE runtime here]"
-        val named = owner.methods.filter { nameMatches(it.name, method) }
+        val named = owner.methods.filter { KotlinJvmNames.matches(owner, it.name, method) }
         val withComposer = named.count { m -> m.parameterTypes.any { isComposerType(it) } }
         val sigs = named.take(4)
             .joinToString(" ; ") { m -> m.parameterTypes.joinToString(",") { it.simpleName } }
@@ -264,7 +255,7 @@ object ComposableAbi {
         val getter =
             "get" + propertyName.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
         val m = receiver.javaClass.methods.firstOrNull { method ->
-            nameMatches(method.name, getter) && composerIndex(method) == 0 &&
+            KotlinJvmNames.matches(receiver.javaClass, method.name, getter) && composerIndex(method) == 0 &&
                     (1 until method.parameterCount).all { method.parameterTypes[it] == Int::class.javaPrimitiveType }
         } ?: return NotComposableProperty
         // Shape: (Composer, $changed…) — no value params. Thread the composer, zero the trailing $changed ints.
@@ -367,7 +358,7 @@ object ComposableAbi {
         InterpProfile.count("composeCacheMiss")
         val k = suppliedArgs.size
         val shaped = owner.methods.filter { m ->
-            nameMatches(m.name, name) && composerIndex(m).let { ci ->
+            KotlinJvmNames.matches(owner, m.name, name) && composerIndex(m).let { ci ->
                 ci >= k && (ci + 1 until m.parameterCount).all { m.parameterTypes[it] == Int::class.javaPrimitiveType }
             }
         }

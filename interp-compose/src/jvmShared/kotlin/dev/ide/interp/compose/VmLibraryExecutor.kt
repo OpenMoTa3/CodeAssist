@@ -49,6 +49,9 @@ class VmLibraryExecutor(
     private val hostLoadable: ((String) -> Boolean)? = null,
     /** Test seam: overrides where class bytes come from (default: the [jars]). */
     source: ClassBytesSource? = null,
+    /** Test seam: the namespaces interpreted from the project jars even when host-loadable (see
+     *  [PROJECT_PREFERRED_PREFIXES], the production default). */
+    private val projectPreferredPrefixes: List<String> = PROJECT_PREFERRED_PREFIXES,
 ) : LibraryExecutor, AutoCloseable {
 
     /** When set (the preview dispatcher wires it to its partial-render channel), a failure inside an
@@ -75,6 +78,14 @@ class VmLibraryExecutor(
             ?: (runCatching { Class.forName(binaryName, false, hostLoader) }.getOrNull() != null)
     }
 
+    /** The VM interpret gate: run a class from the project jars when the host can't load it (a downloaded
+     *  Maven jar / AAR) OR when it's a [PROJECT_PREFERRED_PREFIXES] namespace we prefer the project's own
+     *  (version-correct) copy for even though the host bundles one. [Vm.resolve] still requires the class
+     *  bytes to actually be present in the jars, so a project that ships no Material3 of its own keeps
+     *  bridging to the bundled build unchanged. */
+    private fun shouldInterpret(binaryName: String): Boolean =
+        projectPreferredPrefixes.any { binaryName.startsWith(it) } || !isHostLoadable(binaryName)
+
     /** Class bytes for the project's library jars (a downloaded Maven jar / AAR), keyed by internal name. Shared
      *  by the main VM and the reified-inline executor (a library reified inline lives in one of these jars). */
     private val jarSource: ClassBytesSource = source ?: ClassBytesSource { internalName ->
@@ -83,9 +94,20 @@ class VmLibraryExecutor(
         }
     }
 
+    /** Class bytes for `@kotlin.Metadata` decode: the project jars first, then the host classpath (a
+     *  standard-library facade). Matches the byte source the [reifiedExecutor] interprets from, so the same
+     *  resolver serves the main VM and the reified path. */
+    private val classpathBytes = ClassBytesSource.fromClasspath(hostLoader)
+    private val metadataSource = ClassBytesSource { n -> jarSource.bytesFor(n) ?: classpathBytes.bytesFor(n) }
+
+    /** Authoritative mangled-name resolution from the callee's `@Metadata` — the bytecode-VM counterpart to
+     *  :interp-core's `KotlinJvmNames`, replacing the old name-shape guess so the whole interpreter resolves
+     *  mangled names the one way. */
+    private val kotlinNames = VmKotlinNames(metadataSource)
+
     private val vm = Vm(
         source = jarSource,
-        policy = InterpretPolicy { internalName -> !isHostLoadable(internalName.replace('/', '.')) },
+        policy = InterpretPolicy { internalName -> shouldInterpret(internalName.replace('/', '.')) },
         peerFactory = peerFactory,
     )
 
@@ -93,7 +115,7 @@ class VmLibraryExecutor(
      *  call-site type argument — the general reification mechanism. Reads bytes from the project jars first, then
      *  the host classpath (a standard-library reified inline like `filterIsInstance` on desktop). Lazy: only
      *  built when a reified inline is actually hit. */
-    private val reifiedExecutor by lazy { ReifiedInlineExecutor(extraSource = jarSource, loader = hostLoader, peerFactory = peerFactory) }
+    private val reifiedExecutor by lazy { ReifiedInlineExecutor(extraSource = jarSource, loader = hostLoader, peerFactory = peerFactory, nameMatcher = kotlinNames) }
 
     override fun hasClass(fqn: String): Boolean = vm.hasInterpretedClass(fqn)
 
@@ -178,7 +200,7 @@ class VmLibraryExecutor(
     /** Whether interpreted [ownerFqn] declares a transformed composable for Kotlin [method] — a method with a
      *  `Composer` parameter. The VM-side ground truth, mirroring `ComposableAbi.isComposableCall`. */
     fun isComposableCallable(ownerFqn: String, method: String): Boolean =
-        vm.interpretedMethods(ownerFqn).any { nameMatches(it.name, method) && composerIndex(it) >= 0 }
+        vm.interpretedMethods(ownerFqn).any { kotlinNames.matches(it, method) && composerIndex(it) >= 0 }
 
     /**
      * Invoke a transformed library composable INTERPRETED in the VM, threading [composer] plus the trailing
@@ -261,7 +283,7 @@ class VmLibraryExecutor(
     fun readComposableProperty(receiver: Any, name: String, composer: Any): LibraryValue? {
         val getter = getterName(name)
         val view = vm.interpretedMethodsOf(receiver).firstOrNull { v ->
-            !v.isStatic && !v.isAbstract && nameMatches(v.name, getter) && composerIndex(v) == 0
+            !v.isStatic && !v.isAbstract && kotlinNames.matches(v, getter) && composerIndex(v) == 0
         } ?: return null
         val args = ArrayList<Any?>(view.paramDescriptors.size)
         args.add(composer)
@@ -280,7 +302,7 @@ class VmLibraryExecutor(
         wantStatic: Boolean,
     ): VmMethodView? {
         val candidates = vm.interpretedMethods(ownerFqn).filter {
-            it.isStatic == wantStatic && !it.isAbstract && nameMatches(it.name, method) && composerIndex(it) >= 0
+            it.isStatic == wantStatic && !it.isAbstract && kotlinNames.matches(it, method) && composerIndex(it) >= 0
         }
         val fitting = candidates.filter { v ->
             val n = composerIndex(v)
@@ -320,7 +342,7 @@ class VmLibraryExecutor(
         args: List<Any?>,
         leadingReceivers: Int,
     ): Res? {
-        val named = methods.filter { it.isStatic == wantStatic && !it.isAbstract && nameMatches(it.name, kotlinName) }
+        val named = methods.filter { it.isStatic == wantStatic && !it.isAbstract && kotlinNames.matches(it, kotlinName) }
         if (args.none { it === OmittedArg }) {
             named.firstOrNull { it.paramDescriptors.size == args.size && fitsAll(it.paramDescriptors, args) }
                 ?.let { return Res(it.invoke(receiver, bindArgs(it.paramDescriptors, args))) }
@@ -329,7 +351,7 @@ class VmLibraryExecutor(
         }
         // `name$default` is STATIC even for an instance method, with the receiver as its first real parameter
         // (not numbered in the mask).
-        val defaults = methods.filter { it.isStatic && isDefaultSynthetic(it.name, kotlinName) }
+        val defaults = methods.filter { it.isStatic && kotlinNames.isDefaultSynthetic(it, kotlinName) }
         if (defaults.isNotEmpty()) {
             val realArgs = if (wantStatic) args else listOf(receiver!!) + args
             val maskShift = leadingReceivers + if (wantStatic) 0 else 1
@@ -378,15 +400,8 @@ class VmLibraryExecutor(
         return Res(view.invoke(null, slots.toList()))
     }
 
-    private fun isDefaultSynthetic(jvmName: String, kotlinName: String): Boolean =
-        jvmName == "$kotlinName\$default" || (jvmName.startsWith("$kotlinName-") && jvmName.endsWith("\$default"))
-
     private fun isDefaultSyntheticCtor(v: VmMethodView): Boolean =
         v.paramDescriptors.lastOrNull() == "Lkotlin/jvm/internal/DefaultConstructorMarker;"
-
-    /** Kotlin-name match allowing the value-class JVM mangling `name-<hash>` (never containing `$`). */
-    private fun nameMatches(jvmName: String, kotlinName: String): Boolean =
-        jvmName == kotlinName || (jvmName.startsWith("$kotlinName-") && '$' !in jvmName)
 
     private fun getterName(property: String): String =
         "get" + property.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
@@ -465,6 +480,25 @@ class VmLibraryExecutor(
     private companion object {
         const val COMPOSER_DESC = "Landroidx/compose/runtime/Composer;"
         const val BITS_PER_DEFAULT_INT = 31
+
+        /** Namespaces the VM interprets from the PROJECT's library jars even when the host can load them —
+         *  i.e. where the IDE-bundled build is version-skewed against what the project actually depends on.
+         *  Material3 is the motivating case: the bundled Compose Multiplatform Material3 lags the project's
+         *  `androidx.compose.material3:material3` (it lacks the Expressive `ButtonDefaults.shapes()` /
+         *  `Button(shapes=…)` APIs), so bridging to it drops any composable the project's version added.
+         *
+         *  ENABLED for Material3 after the VM-hardening below was validated on ART: `MaterialExpressiveTheme`,
+         *  `ButtonDefaults.buttonColors()`, and a full DRAWING `Button` (Surface + ripple + Row, the ripple
+         *  `Indication` crossing into bridged foundation) all interpret cleanly on device (`VmButtonArtSpike`,
+         *  `VmPrimitiveLambdaBoxingArtSpike`). The enabling fix was the VM's primitive-return `invokedynamic`
+         *  lambda boxing (`jvm-interp` `Interpreter.boxLambdaReturn`) — a `CompositionLocal<Boolean>` default
+         *  factory `{ false }` was boxing as `Integer` not `Boolean`, crashing every Material3 theme.
+         *
+         *  A Material3 composable the VM can't yet interpret surfaces as `… [in <method>@<pc>]` (the enriched
+         *  `CHECKCAST`/dispatch message) — fix it in `:jvm-interp` and re-verify. The runtime/ui/foundation stay
+         *  bridged; widen this list (foundation/ui) only if their value types also need to be the project's copy.
+         *  See [[jvm-interp-bytecode-vm]]. */
+        val PROJECT_PREFERRED_PREFIXES = listOf("androidx.compose.material3.")
     }
 
     private fun primClass(d: Char): Class<*> = when (d) {

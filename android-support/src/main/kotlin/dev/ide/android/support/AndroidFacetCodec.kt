@@ -35,6 +35,8 @@ object AndroidFacetCodec : FacetCodec<AndroidFacet> {
         if (facet.buildFeatures.compose) put("compose", true)
         if (facet.buildFeatures.parcelize) put("parcelize", true)
         if (facet.buildFeatures.serialization) put("serialization", true)
+        // Enabled KSP processors (sorted for a deterministic encode); absent when none are on.
+        if (facet.buildFeatures.kspProcessors.isNotEmpty()) put("kspProcessors", facet.buildFeatures.kspProcessors.sorted())
         // packaging: only when the user configured something (defaults are applied at build time, not stored).
         if (!facet.packaging.isDefault) put("packaging", encodePackaging(facet.packaging))
     }
@@ -47,8 +49,8 @@ object AndroidFacetCodec : FacetCodec<AndroidFacet> {
             minSdk = minSdk,
             targetSdk = values.int("targetSdk") ?: minSdk,
             manifest = values["manifest"] as? String ?: "src/main/AndroidManifest.xml",
-            versionCode = values.int("versionCode") ?: 1,
-            versionName = values["versionName"] as? String ?: "1.0",
+            versionCode = values.int("versionCode") ?: AndroidFacet.DEFAULT_VERSION_CODE,
+            versionName = values["versionName"] as? String ?: AndroidFacet.DEFAULT_VERSION_NAME,
             isApplication = values["isApplication"] as? Boolean ?: true,
             flavorDimensions = values.stringList("flavorDimensions"),
             buildTypes = values.tableList("buildTypes").map { decodeBuildType(it) }
@@ -61,6 +63,7 @@ object AndroidFacetCodec : FacetCodec<AndroidFacet> {
                 compose = values["compose"] as? Boolean ?: false,
                 parcelize = values["parcelize"] as? Boolean ?: false,
                 serialization = values["serialization"] as? Boolean ?: false,
+                kspProcessors = values.stringList("kspProcessors").toSet(),
             ),
             packaging = decodePackaging(values.table("packaging")),
         )

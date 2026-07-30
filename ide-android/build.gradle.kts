@@ -136,6 +136,41 @@ val bundleVmSpikeComposeRuntimeAsset = tasks.register<Copy>("bundleVmSpikeCompos
     into(layout.buildDirectory.dir("vm-spike-asset/vmbench"))
 }
 
+// --- Android material3 classes.jar (androidTest VM interpret spike) ------------------------------
+// VmButtonArtSpike interprets a real DRAWING Material3 composable (Button -> Surface -> ripple -> Row) with
+// the :jvm-interp VM against the app's real dexed Compose runtime/foundation/ui bridged — the piece the
+// desktop harness can't reach (Material3 Surface graphics need Skiko, absent headless). Stage the artifact's
+// classes.jar (non-transitive: only material3's own classes are interpreted; foundation/ui/runtime bridge).
+val vmSpikeMaterial3Aar: Configuration by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+    isTransitive = false
+}
+dependencies { vmSpikeMaterial3Aar("androidx.compose.material3:material3-android:1.4.0-beta01@aar") }
+
+val bundleVmSpikeMaterial3Asset = tasks.register<Copy>("bundleVmSpikeMaterial3Asset") {
+    description = "Stage the androidx material3 classes.jar as an androidTest asset for the VM Button interpret spike."
+    from(vmSpikeMaterial3Aar.elements.map { zipTree(it.single().asFile) }) { include("classes.jar") }
+    rename { "material3-android.jar" }
+    into(layout.buildDirectory.dir("vm-spike-asset/vmbench"))
+}
+
+// --- Moshi runtime jars (androidTest KSP-on-ART real-processor spike) -----------------------------
+// KspArtSpikeTest.bundledMoshiRunsOnArt runs the REAL bundled Moshi processor on ART via the production
+// KspSourceGenerator path. Moshi's runtime (com.squareup.moshi:moshi + okio) is pure JVM — plain jars, no
+// AAR — so it stages cleanly as an androidTest asset for KSP's `libraries` classpath (where `@JsonClass`
+// resolves). The processor itself comes from the app-bundled /processors/moshi.zip; only the runtime (data
+// the module compiles against) is staged here.
+val moshiArtLibs: Configuration by configurations.creating {
+    isCanBeConsumed = false; isCanBeResolved = true; isTransitive = true
+}
+dependencies { moshiArtLibs("com.squareup.moshi:moshi:1.15.2") }
+val bundleMoshiLibsAsset = tasks.register<Copy>("bundleMoshiLibsAsset") {
+    description = "Stage the Moshi runtime jars (moshi + okio) as an androidTest asset for the KSP-on-ART spike."
+    from(provider { moshiArtLibs.filter { it.name.endsWith(".jar") } })
+    into(layout.buildDirectory.dir("moshi-libs-asset/moshi-libs"))
+}
+
 // --- applog-runtime asset (debug-only app-log bridge injected into user apps) --------------------
 // The Android build system weaves this tiny jar (a ContentProvider + LocalSocket log forwarder) into DEBUG
 // builds so a running app forwards its logs to the IDE's Logcat tab. It ships as a plain jar of .class files
@@ -270,8 +305,8 @@ android {
         minSdk = 26
         targetSdk = 36
         // versionCode must exceed the last published release (the previous-codebase app reached ~29).
-        versionCode = 64
-        versionName = "3.7.4"
+        versionCode = 68
+        versionName = "3.8.2"
         // connectedAndroidTest harness (the on-device Kotlin-compiler discovery spike).
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -313,6 +348,7 @@ android {
     sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("r8-dex-asset").get().asFile)
     sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("applog-runtime-asset").get().asFile)
     sourceSets.getByName("androidTest").assets.srcDir(layout.buildDirectory.dir("vm-spike-asset").get().asFile)
+    sourceSets.getByName("androidTest").assets.srcDir(layout.buildDirectory.dir("moshi-libs-asset").get().asFile)
 
     // Release signing, never committed. Resolution order per field: keystore.properties (gitignored,
     // alongside this build script) → Gradle property (-PRELEASE_*) → env var (RELEASE_*). With no keystore
@@ -629,7 +665,7 @@ val fetchAndroidBuildTools = tasks.register("fetchAndroidBuildTools") {
 // Run before anything AGP does, so the freshly-fetched lib*.so are on disk when the native-lib merge runs,
 // and the staged kotlin-stdlib.jar asset is present when the asset merge runs.
 tasks.named("preBuild").configure {
-    dependsOn(fetchAndroidBuildTools, bundleKotlinStdlibAsset, bundleKotlincResourcesAsset, bundleComposeRuntimeAsset, bundleComposeFontsAsset, bundleComposeStringAsset, bundleAgentUiComposeStringAsset, bundleComposeDrawablesAsset, bundleR8DexAsset, bundleAppLogRuntimeAsset, bundleVmSpikeComposeRuntimeAsset)
+    dependsOn(fetchAndroidBuildTools, bundleKotlinStdlibAsset, bundleKotlincResourcesAsset, bundleComposeRuntimeAsset, bundleComposeFontsAsset, bundleComposeStringAsset, bundleAgentUiComposeStringAsset, bundleComposeDrawablesAsset, bundleR8DexAsset, bundleAppLogRuntimeAsset, bundleVmSpikeComposeRuntimeAsset, bundleVmSpikeMaterial3Asset, bundleMoshiLibsAsset)
 }
 
 // Same Android packaging gap as the fonts above, for the i18n string resources. :ide-ui's
@@ -893,6 +929,12 @@ dependencies {
     // transitively via :ide-core, so compile against them here; the app's dexed copies provide them at runtime.
     androidTestCompileOnly(project(":lang-java"))
     androidTestCompileOnly(project(":intellij-psi-host"))
+    // KspArtSpikeTest drives KSP2 on ART: BundledKspThin/BundledKspProcessors (lang-ksp) + the KSP2 SPI/config
+    // (KSPJvmConfig/SymbolProcessorProvider/…). All reach the app only transitively via :ide-core → :lang-ksp
+    // (implementation), so compile against them here; the app's dexed copies provide them at runtime.
+    androidTestCompileOnly(project(":lang-ksp"))
+    androidTestCompileOnly(libs.ksp.api)
+    androidTestCompileOnly(libs.ksp.common.deps)
 }
 
 // ============================================================================

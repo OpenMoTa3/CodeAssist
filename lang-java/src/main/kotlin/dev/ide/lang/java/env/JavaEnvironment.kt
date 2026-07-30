@@ -9,6 +9,7 @@ import com.intellij.psi.PsiFileFactory
 import com.intellij.psi.PsiJavaFile
 import com.intellij.psi.impl.PsiModificationTrackerImpl
 import com.intellij.psi.util.PsiModificationTracker
+import dev.ide.platform.log.Log
 import dev.ide.psi.IntellijPsiHost
 import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.cli.create
@@ -94,13 +95,27 @@ class JavaEnvironment private constructor(
     /**
      * Parse [text] into a [PsiJavaFile] belonging to THIS project (so [facade] resolution sees the classpath +
      * source roots), named [name]. Never throws on invalid input — broken regions become `PsiErrorElement`s.
-     * Fully materialized under the shared parse lock, so no `buildTree` runs during the unlocked traversal that
-     * follows. [name] should end in `.java`; it need not correspond to a real file on disk.
+     * Fully materialized under the shared parse lock, so the unlocked traversal that follows walks a built tree.
+     * [name] should end in `.java`; it need not correspond to a real file on disk.
+     *
+     * `eventSystemEnabled = false` is what makes "materialized under the lock" actually stick: `PsiFileImpl`
+     * keeps its `FileElement` by a hard reference only for a non-event-system file, and by a `SoftReference`
+     * otherwise — and a collected soft reference means the next node access REPARSES the file, i.e. a
+     * `buildTree` outside the parse lock, which is the corruption the lock exists to prevent (a real risk on a
+     * tight-heap device). Resolution is unaffected: the only `ResolveScopeManager` a core project environment
+     * has is `MockResolveScopeManager` (`CoreProjectEnvironment.createResolveScopeManager`, not overridden by
+     * `JavaCoreProjectEnvironment`/`KotlinCoreProjectEnvironment`), and it returns `allScope` for every element
+     * without ever consulting physicality. `markAsCopy = false` likewise only drops IntelliJ's
+     * `GeneratedMarkerVisitor` pass, whose tree walk [IntellijPsiHost.forceFullParse] already does properly —
+     * and whose per-node "generated" marking is untrue of a file that mirrors user text. See
+     * [dev.ide.psi.IntellijPsiHost.parse], which uses the same shape for the same reasons.
      */
     fun parse(name: String, text: CharSequence): PsiJavaFile = IntellijPsiHost.withParseLock {
         val fileName = if (name.endsWith(".java")) name else "$name.java"
-        val file =
-            fileFactory.createFileFromText(fileName, JavaLanguage.INSTANCE, text) as PsiJavaFile
+        val file = fileFactory.createFileFromText(
+            fileName, JavaLanguage.INSTANCE, text,
+            /* eventSystemEnabled = */ false, /* markAsCopy = */ false,
+        ) as PsiJavaFile
         IntellijPsiHost.forceFullParse(file)
         file
     }
@@ -125,6 +140,9 @@ class JavaEnvironment private constructor(
             // rather than racing to create a second application env.
             IntellijPsiHost.warmUp()
 
+            // Drop any corrupt/unreadable classpath jar so one bad library can't crash the whole env.
+            val usable = usableClasspath(classpath)
+
             val configuration = CompilerConfiguration.create(
                 diagnosticsCollector = BaseDiagnosticsCollector.DoNothing,
                 messageCollector = MessageCollector.NONE,
@@ -136,14 +154,37 @@ class JavaEnvironment private constructor(
                 } else {
                     put(JVMConfigurationKeys.NO_JDK, true)
                 }
-                addJvmClasspathRoots(classpath)
+                addJvmClasspathRoots(usable)
                 addJavaSourceRoots(sourceRoots)
             }
             val disposable = Disposer.newDisposable("java-env-$moduleName")
             val env = KotlinCoreEnvironment.createForProduction(
                 disposable, configuration, EnvironmentConfigFiles.JVM_CONFIG_FILES,
             )
-            JavaEnvironment(env, disposable, classpath, sourceRoots, jdkHome).also { it.installInjectedFinder() }
+            JavaEnvironment(env, disposable, usable, sourceRoots, jdkHome).also { it.installInjectedFinder() }
+        }
+
+        private val log = Log.logger("JavaEnvironment")
+
+        /** Cache of jar usability keyed by path+size+mtime, so a warm env re-uses the verdict (never re-opens). */
+        private val jarUsable = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+        /**
+         * Drop any classpath JAR that can't be opened as a well-formed zip — a truncated or partially-written
+         * cache entry (e.g. an AAR exploded by an interrupted run). The Kotlin compiler reads classpath jars
+         * through the mmap-backed `FastJarFileSystem`, which THROWS out of [KotlinCoreEnvironment.createForProduction]
+         * on a corrupt central directory (`IllegalArgumentException: 0: 67324752` — a local-header signature where
+         * the directory should be), taking down the ENTIRE Java analyzer for the module over one bad library.
+         * Dropping the unreadable jar degrades that library to "unresolved" instead. Class dirs / non-jars pass
+         * through untouched; a valid jar is always kept (so this is inert on a healthy classpath, incl. desktop).
+         */
+        private fun usableClasspath(classpath: List<File>): List<File> = classpath.filter { f ->
+            if (!f.isFile || !f.name.endsWith(".jar", ignoreCase = true)) return@filter true
+            jarUsable.getOrPut("${f.path}|${f.length()}|${f.lastModified()}") {
+                runCatching { java.util.zip.ZipFile(f).use { it.entries().hasMoreElements() } }
+                    .getOrDefault(false)
+                    .also { ok -> if (!ok) log.warn("dropping unreadable classpath jar from the Java resolution env: ${f.path}") }
+            }
         }
     }
 
