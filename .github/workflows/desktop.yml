@@ -26,15 +26,22 @@ jobs:
               apk update
               apk add openjdk21-jdk git bash binutils fakeroot
 
-              # 1. 彻底递归清除所有源码/配置（包括 build-logic/**/*.kt）中的 JetBrains vendor 限制
-              find . -type f \( -name '*.kt' -o -name '*.kts' -o -name '*.gradle' -o -name '*.properties' \) -exec sed -i -E \
+              # 1. 彻底干掉强制绑定 JetBrains 的 Daemon 配置文件（核心修复）
+              rm -f gradle/gradle-daemon-jvm.properties .gradle/daemon-jvm.properties
+              find . -name '*daemon-jvm.properties' -delete
+
+              # 2. 移除代码中的 Vendor 限制
+              find . -type f \( -name '*.kt' -o -name '*.kts' -o -name '*.gradle' \) -exec sed -i -E \
                 -e 's/JvmVendorSpec\.JETBRAINS/JvmVendorSpec.any()/g' \
                 -e 's/vendor\.set\([^)]*\)//g' \
-                -e 's/vendor\s*=\s*JvmVendorSpec\.[A-Za-z0-9_]+/vendor = JvmVendorSpec.any()/g' \
                 {} + 2>/dev/null || true
 
-              # 2. 传入 Alpine 原生 JDK 执行纯 musl 桌面构建
+              # 3. 注入系统原生 JDK 环境变量并构建
+              export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+              export PATH=\$JAVA_HOME/bin:\$PATH
+
               ./gradlew :app:ide-desktop:createDistributable \
+                --no-daemon \
                 -Pkotlin.native.ignoreDisabledTargets=true \
                 -Porg.gradle.java.installations.auto-download=false \
                 -Porg.gradle.java.installations.paths=/usr/lib/jvm/java-21-openjdk \
