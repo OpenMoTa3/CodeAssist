@@ -6,40 +6,43 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-musl:
+  build-pure-musl:
     runs-on: ubuntu-24.04-arm
 
     steps:
-      # 1. 宿主外层检出代码（正常使用 Node）
       - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      # 2. 核心：在原生 Alpine Linux (musl) 容器内编译纯 musl 桌面包
-      - name: Build inside Pure Alpine ARM64 Container
+      # 纯原生 Alpine 容器编译（完全不安装 gcompat）
+      - name: Build with Native Alpine musl JDK
         run: |
           docker run --rm \
             -v ${{ github.workspace }}:/work \
             -w /work \
-            -e JAVA_HOME=/usr/lib/jvm/java-17-openjdk \
             alpine:edge sh -c "
               set -e
               apk update
-              apk add openjdk17-jdk git bash binutils fakeroot
-              ./gradlew :app:ide-desktop:createDistributable -Pkotlin.native.ignoreDisabledTargets=true --stacktrace
+              # 仅安装 Alpine 纯原生编译依赖与原生 OpenJDK 21
+              apk add openjdk21-jdk git bash binutils fakeroot
+
+              # 强制禁止 Gradle 自动下载外部 glibc 工具链，强制使用 Alpine 原生 JDK
+              ./gradlew :app:ide-desktop:createDistributable \
+                -Pkotlin.native.ignoreDisabledTargets=true \
+                -Porg.gradle.java.installations.auto-download=false \
+                -Porg.gradle.java.installations.paths=/usr/lib/jvm/java-21-openjdk \
+                --stacktrace
             "
 
-      # 3. 将编译出的纯 musl 绿色包压缩打包
       - name: Package Tarball
         run: |
           cd app/ide-desktop/build/compose/binaries/main/app/
-          tar -czvf ${{ github.workspace }}/CodeAssist-pmOS-musl-arm64.tar.gz *
+          tar -czvf ${{ github.workspace }}/CodeAssist-pmOS-pure-musl-arm64.tar.gz *
 
-      # 4. 上传产物
-      - name: Upload Musl Artifact
+      - name: Upload Pure Musl Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CodeAssist-pmOS-musl-arm64
-          path: CodeAssist-pmOS-musl-arm64.tar.gz
+          name: CodeAssist-pmOS-pure-musl-arm64
+          path: CodeAssist-pmOS-pure-musl-arm64.tar.gz
