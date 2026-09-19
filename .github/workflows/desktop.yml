@@ -16,7 +16,6 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      # 纯原生 Alpine 容器编译（完全不安装 gcompat）
       - name: Build with Native Alpine musl JDK
         run: |
           docker run --rm \
@@ -25,10 +24,15 @@ jobs:
             alpine:edge sh -c "
               set -e
               apk update
-              # 仅安装 Alpine 纯原生编译依赖与原生 OpenJDK 21
               apk add openjdk21-jdk git bash binutils fakeroot
 
-              # 强制禁止 Gradle 自动下载外部 glibc 工具链，强制使用 Alpine 原生 JDK
+              # 1. 移除对 JetBrains 专属 Vendor 的死锁绑定，允许使用 Alpine 原生 JDK
+              find . -name '*.gradle.kts' -o -name '*.gradle' | xargs sed -i \
+                -e 's/vendor.set(JvmVendorSpec.JETBRAINS)//g' \
+                -e 's/vendor = JvmVendorSpec.JETBRAINS//g' \
+                -e 's/JvmVendorSpec.JETBRAINS/JvmVendorSpec.any()/g' 2>/dev/null || true
+
+              # 2. 传入 Alpine 原生 JDK 执行纯 musl 桌面构建
               ./gradlew :app:ide-desktop:createDistributable \
                 -Pkotlin.native.ignoreDisabledTargets=true \
                 -Porg.gradle.java.installations.auto-download=false \
