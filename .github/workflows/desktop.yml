@@ -3,41 +3,40 @@ name: Build Desktop for pmOS (Linux ARM64)
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch: # 支持手动一键点击触发构建
+  workflow_dispatch: # 支持网页端手动点击触发构建
 
 jobs:
-  build-arm64-desktop:
-    runs-on: ubuntu-latest
+  build:
+    # 直接使用 GitHub 官方原生 64位 ARM Runner
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up QEMU for ARM64 Emulation
-        uses: docker/setup-qemu-action@v3
+      # Compose Desktop 打包必须使用 JDK 17
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          platforms: linux/arm64
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
 
-      - name: Build Desktop Distributable inside ARM64 Container
-        uses: addnab/docker-run-action@v3
-        with:
-          image: arm64v8/ubuntu:22.04
-          options: -v ${{ github.workspace }}:/work -w /work
-          run: |
-            apt-get update
-            apt-get install -y openjdk-17-jdk binutils fakeroot git
-            export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-arm64
-            chmod +x gradlew
-            
-            # 针对 Compose Multiplatform Desktop 执行专属绿色解压包构建
-            ./gradlew :desktop:createDistributable --stacktrace
-            
-            # 打包成标准 tar.gz 方便直接传到手机解压
-            cd desktop/build/compose/binaries/main/app/
-            tar -czvf /work/CodeAssist-Desktop-Linux-ARM64.tar.gz *
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # 执行原生 ARM64 桌面绿色版打包
+      - name: Build Desktop Distributable
+        run: ./gradlew :desktop:createDistributable
+
+      # 将生成的 ARM64 独立运行包压缩并导出
+      - name: Package Tarball
+        run: |
+          cd desktop/build/compose/binaries/main/app/
+          tar -czvf ${{ github.workspace }}/CodeAssist-Linux-arm64.tar.gz *
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CodeAssist-Desktop-pmOS-ARM64
-          path: CodeAssist-Desktop-Linux-ARM64.tar.gz
+          name: CodeAssist-Linux-arm64
+          path: CodeAssist-Linux-arm64.tar.gz
