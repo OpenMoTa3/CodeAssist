@@ -26,11 +26,12 @@ jobs:
               apk update
               apk add openjdk21-jdk git bash binutils fakeroot
 
-              # 1. 移除对 JetBrains 专属 Vendor 的死锁绑定，允许使用 Alpine 原生 JDK
-              find . -name '*.gradle.kts' -o -name '*.gradle' | xargs sed -i \
-                -e 's/vendor.set(JvmVendorSpec.JETBRAINS)//g' \
-                -e 's/vendor = JvmVendorSpec.JETBRAINS//g' \
-                -e 's/JvmVendorSpec.JETBRAINS/JvmVendorSpec.any()/g' 2>/dev/null || true
+              # 1. 彻底递归清除所有源码/配置（包括 build-logic/**/*.kt）中的 JetBrains vendor 限制
+              find . -type f \( -name '*.kt' -o -name '*.kts' -o -name '*.gradle' -o -name '*.properties' \) -exec sed -i -E \
+                -e 's/JvmVendorSpec\.JETBRAINS/JvmVendorSpec.any()/g' \
+                -e 's/vendor\.set\([^)]*\)//g' \
+                -e 's/vendor\s*=\s*JvmVendorSpec\.[A-Za-z0-9_]+/vendor = JvmVendorSpec.any()/g' \
+                {} + 2>/dev/null || true
 
               # 2. 传入 Alpine 原生 JDK 执行纯 musl 桌面构建
               ./gradlew :app:ide-desktop:createDistributable \
