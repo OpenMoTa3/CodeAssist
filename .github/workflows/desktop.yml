@@ -26,21 +26,20 @@ jobs:
               apk update
               apk add openjdk21-jdk git bash binutils fakeroot
 
-              # 1. 彻底干掉强制绑定 JetBrains 的 Daemon 配置文件（核心修复）
+              # 1. 彻底清除 Daemon 绑定与代码中的 Vendor 限制
               rm -f gradle/gradle-daemon-jvm.properties .gradle/daemon-jvm.properties
               find . -name '*daemon-jvm.properties' -delete
 
-              # 2. 移除代码中的 Vendor 限制
               find . -type f \( -name '*.kt' -o -name '*.kts' -o -name '*.gradle' \) -exec sed -i -E \
                 -e 's/JvmVendorSpec\.JETBRAINS/JvmVendorSpec.any()/g' \
                 -e 's/vendor\.set\([^)]*\)//g' \
                 {} + 2>/dev/null || true
 
-              # 3. 注入系统原生 JDK 环境变量并构建
               export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
               export PATH=\$JAVA_HOME/bin:\$PATH
 
-              ./gradlew :app:ide-desktop:createDistributable \
+              # 2. 精确指定模块 :ide-desktop 执行构建
+              ./gradlew :ide-desktop:createDistributable \
                 --no-daemon \
                 -Pkotlin.native.ignoreDisabledTargets=true \
                 -Porg.gradle.java.installations.auto-download=false \
@@ -48,11 +47,13 @@ jobs:
                 --stacktrace
             "
 
+      # 3. 精确指定 app/ide-desktop 目录打包产物
       - name: Package Tarball
         run: |
           cd app/ide-desktop/build/compose/binaries/main/app/
           tar -czvf ${{ github.workspace }}/CodeAssist-pmOS-pure-musl-arm64.tar.gz *
 
+      # 4. 上传产物
       - name: Upload Pure Musl Artifact
         uses: actions/upload-artifact@v4
         with:
