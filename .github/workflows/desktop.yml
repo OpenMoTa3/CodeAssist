@@ -1,61 +1,115 @@
-name: Build Pure Musl Desktop for pmOS (ARM64)
+name: Build CodeAssist Desktop for pmOS (Local JDK Native)
 
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: # 支持网页端手动一键触发
 
 jobs:
-  build-pure-musl:
+  build-desktop:
+    # 采用官方原生 64位 ARM64 Runner，保证构建环境与手机芯片 100% 硬件同构
     runs-on: ubuntu-24.04-arm
 
     steps:
+      # 1. 全量检出源码
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Grant execute permission for gradlew
+      # 2. 配置标准编译环境 JDK 21
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      # 3. 赋予 Gradle Wrapper 执行权限
+      - name: Grant Execute Permission
         run: chmod +x gradlew
 
-      - name: Build with Native Alpine musl JDK
+      # 4. 彻底清除写死的 JetBrains 专属 Daemon 限制与源码 Vendor 绑定
+      - name: Patch Gradle and Vendor Restrictions
         run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/work \
-            -w /work \
-            alpine:edge sh -c "
-              set -e
-              apk update
-              apk add openjdk21-jdk git bash binutils fakeroot
+          echo "==> Cleaning Daemon properties..."
+          rm -f gradle/gradle-daemon-jvm.properties .gradle/daemon-jvm.properties
+          find . -name '*daemon-jvm.properties' -delete || true
 
-              # 1. 彻底清除 Daemon 绑定与代码中的 Vendor 限制
-              rm -f gradle/gradle-daemon-jvm.properties .gradle/daemon-jvm.properties
-              find . -name '*daemon-jvm.properties' -delete
+          echo "==> Patching vendor constraints in build scripts and source files..."
+          find . -type f \( -name '*.kt' -o -name '*.kts' -o -name '*.gradle' \) -exec sed -i -E \
+            -e 's/JvmVendorSpec\.JETBRAINS/JvmVendorSpec.any()/g' \
+            -e 's/vendor\.set\([^)]*\)//g' \
+            -e 's/vendor\s*=\s*JvmVendorSpec\.[A-Za-z0-9_]+/vendor = JvmVendorSpec.any()/g' \
+            {} + 2>/dev/null || true
 
-              find . -type f \( -name '*.kt' -o -name '*.kts' -o -name '*.gradle' \) -exec sed -i -E \
-                -e 's/JvmVendorSpec\.JETBRAINS/JvmVendorSpec.any()/g' \
-                -e 's/vendor\.set\([^)]*\)//g' \
-                {} + 2>/dev/null || true
-
-              export JAVA_HOME=/usr/lib/jvm/java-21-openjdk
-              export PATH=\$JAVA_HOME/bin:\$PATH
-
-              # 2. 精确指定模块 :ide-desktop 执行构建
-              ./gradlew :ide-desktop:createDistributable \
-                --no-daemon \
-                -Pkotlin.native.ignoreDisabledTargets=true \
-                -Porg.gradle.java.installations.auto-download=false \
-                -Porg.gradle.java.installations.paths=/usr/lib/jvm/java-21-openjdk \
-                --stacktrace
-            "
-
-      # 3. 精确指定 app/ide-desktop 目录打包产物
-      - name: Package Tarball
+      # 5. 执行桌面图形端标准分发构建（installDist：依赖本地 JDK，零冗余 Runtime）
+      - name: Build Desktop Application (installDist)
         run: |
-          cd app/ide-desktop/build/compose/binaries/main/app/
-          tar -czvf ${{ github.workspace }}/CodeAssist-pmOS-pure-musl-arm64.tar.gz *
+          echo "==> Building Desktop GUI Distribution..."
+          ./gradlew :ide-desktop:installDist \
+            --no-daemon \
+            -Pkotlin.native.ignoreDisabledTargets=true \
+            --stacktrace || \
+          ./gradlew installDist \
+            --no-daemon \
+            -Pkotlin.native.ignoreDisabledTargets=true \
+            --stacktrace
 
-      # 4. 上传产物
-      - name: Upload Pure Musl Artifact
+      # 6. 为 postmarketOS 手机定制环境注入启动补丁与桌面快捷方式
+      - name: Prepare Final Distribution Package
+        run: |
+          # 自动定位打包生成的目录
+          TARGET_DIR=$(find . -type d -path "*/build/install/*" 2>/dev/null | head -n 1)
+          if [ -z "$TARGET_DIR" ]; then
+            echo "Error: Build output directory not found!"
+            exit 1
+          fi
+          echo "Found build directory at: $TARGET_DIR"
+
+          APP_DIR="${{ github.workspace }}/CodeAssist-pmOS"
+          mkdir -p "$APP_DIR"
+          cp -r "$TARGET_DIR"/* "$APP_DIR"/
+
+          # 自动定位启动脚本并注入 postmarketOS 专用的图形符号预加载
+          BIN_SCRIPT=$(find "$APP_DIR/bin" -type f ! -name "*.bat" | head -n 1)
+          echo "Patching launcher script: $BIN_SCRIPT"
+          
+          # 在脚本开头注入 LD_PRELOAD，确保 Skiko 图形库在 musl 系统上顺利加载
+          sed -i '2i export LD_PRELOAD=/lib/libgcompat.so.0:$LD_PRELOAD' "$BIN_SCRIPT"
+          sed -i '3i export JAVA_HOME=${JAVA_HOME:-/usr/lib/jvm/default-jvm}' "$BIN_SCRIPT"
+          chmod +x "$BIN_SCRIPT"
+
+          # 创建根目录一键启动器
+          cat << 'EOF' > "$APP_DIR/start-codeassist.sh"
+          #!/bin/sh
+          export LD_PRELOAD=/lib/libgcompat.so.0:$LD_PRELOAD
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          BIN=$(find "$DIR/bin" -type f ! -name "*.bat" | head -n 1)
+          exec "$BIN" "$@"
+          EOF
+          chmod +x "$APP_DIR/start-codeassist.sh"
+
+          # 生成标准 Linux 桌面图标文件（方便直接扔进系统菜单）
+          cat << 'EOF' > "$APP_DIR/codeassist.desktop"
+          [Desktop Entry]
+          Name=CodeAssist
+          Comment=Compose Multiplatform Mobile & Desktop IDE
+          Exec=/bin/sh -c "exec $(find $HOME/CodeAssist -name start-codeassist.sh 2>/dev/null || echo $HOME/CodeAssist/start-codeassist.sh)"
+          Icon=utilities-terminal
+          Terminal=false
+          Type=Application
+          Categories=Development;IDE;
+          EOF
+
+          # 打包为最终的分发压缩包
+          cd "${{ github.workspace }}"
+          tar -czvf CodeAssist-Desktop-pmOS-arm64.tar.gz -C "$APP_DIR" .
+
+      # 7. 上传完整的桌面端压缩包到 GitHub Artifacts
+      - name: Upload Desktop Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CodeAssist-pmOS-pure-musl-arm64
-          path: CodeAssist-pmOS-pure-musl-arm64.tar.gz
+          name: CodeAssist-Desktop-pmOS-arm64
+          path: CodeAssist-Desktop-pmOS-arm64.tar.gz
+          retention-days: 7
