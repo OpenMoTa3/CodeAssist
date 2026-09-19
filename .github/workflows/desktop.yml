@@ -1,0 +1,43 @@
+name: Build Desktop for pmOS (Linux ARM64)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: # 支持手动一键点击触发构建
+
+jobs:
+  build-arm64-desktop:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for ARM64 Emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
+
+      - name: Build Desktop Distributable inside ARM64 Container
+        uses: addnab/docker-run-action@v3
+        with:
+          image: arm64v8/ubuntu:22.04
+          options: -v ${{ github.workspace }}:/work -w /work
+          run: |
+            apt-get update
+            apt-get install -y openjdk-17-jdk binutils fakeroot git
+            export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-arm64
+            chmod +x gradlew
+            
+            # 针对 Compose Multiplatform Desktop 执行专属绿色解压包构建
+            ./gradlew :desktop:createDistributable --stacktrace
+            
+            # 打包成标准 tar.gz 方便直接传到手机解压
+            cd desktop/build/compose/binaries/main/app/
+            tar -czvf /work/CodeAssist-Desktop-Linux-ARM64.tar.gz *
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodeAssist-Desktop-pmOS-ARM64
+          path: CodeAssist-Desktop-Linux-ARM64.tar.gz
