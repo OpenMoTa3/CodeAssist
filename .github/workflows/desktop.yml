@@ -9,36 +9,35 @@ jobs:
   build-musl:
     runs-on: ubuntu-24.04-arm
 
-    # 直接在原生 Alpine Linux (musl) 容器内执行全套编译
-    container:
-      image: alpine:edge
-
     steps:
-      - name: Install Alpine Native Build Dependencies
-        run: |
-          apk update
-          # 安装 Alpine 原生 musl JDK 17 及桌面构建依赖
-          apk add openjdk17-jdk git bash binutils fakeroot dpkg libx11-dev libxext-dev libxrender-dev libxtst-dev libxi-dev
-
+      # 1. 宿主外层检出代码（正常使用 Node）
       - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      # 使用 Alpine 原生 musl JDK 进行 jpackage 裁剪与打包
-      - name: Build Pure Musl Distributable
-        env:
-          JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+      # 2. 核心：在原生 Alpine Linux (musl) 容器内编译纯 musl 桌面包
+      - name: Build inside Pure Alpine ARM64 Container
         run: |
-          ./gradlew :app:ide-desktop:createDistributable -Pkotlin.native.ignoreDisabledTargets=true --stacktrace
+          docker run --rm \
+            -v ${{ github.workspace }}:/work \
+            -w /work \
+            -e JAVA_HOME=/usr/lib/jvm/java-17-openjdk \
+            alpine:edge sh -c "
+              set -e
+              apk update
+              apk add openjdk17-jdk git bash binutils fakeroot
+              ./gradlew :app:ide-desktop:createDistributable -Pkotlin.native.ignoreDisabledTargets=true --stacktrace
+            "
 
-      # 压缩打包纯 musl 产物
+      # 3. 将编译出的纯 musl 绿色包压缩打包
       - name: Package Tarball
         run: |
           cd app/ide-desktop/build/compose/binaries/main/app/
           tar -czvf ${{ github.workspace }}/CodeAssist-pmOS-musl-arm64.tar.gz *
 
+      # 4. 上传产物
       - name: Upload Musl Artifact
         uses: actions/upload-artifact@v4
         with:
